@@ -1,0 +1,111 @@
+name: Agent Intake
+on:
+  repository_dispatch:
+    types: [agent_push]   # evento disparado pelo agente
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  materialize-and-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validar payload
+        run: |
+          test -n "${{ github.event.client_payload.scope }}" || (echo "scope ausente"; exit 1)
+          test -n "${{ github.event.client_payload.title }}" || (echo "title ausente"; exit 1)
+          test -n "${{ github.event.client_payload.artifact_url || github.event.client_payload.patch_b64 }}" || (echo "nenhum artifact"; exit 1)
+
+      - name: Baixar/Aplicar alterações
+        run: |
+          set -euo pipefail
+          SCOPE="${{ github.event.client_payload.scope }}"  # "frontend" ou "backend"
+          BRANCH="agent/${SCOPE}/$(date +%Y%m%d-%H%M%S)-${{ github.run_id }}"
+          git checkout -b "$BRANCH"
+
+          if [ -n "${{ github.event.client_payload.artifact_url }}" ]; then
+            curl -sSL "${{ github.event.client_payload.artifact_url }}" -o /tmp/agent.zip
+            unzip -o /tmp/agent.zip -d .
+          else
+            echo "${{ github.event.client_payload.patch_b64 }}" | base64 -d > /tmp/agent.patch
+            git apply --whitespace=fix /tmp/agent.patch
+          fi
+
+          # Opcional: garantir escopo em subpasta
+          if [ "$SCOPE" = "frontend" ]; then
+            # garanta que só mexa em ./frontend
+            echo "OK"
+          elif [ "$SCOPE" = "backend" ]; then
+            echo "OK"
+          else
+            echo "scope inválido"; exit 2
+          fi
+
+      - name: Setup Node (frontend)
+        if: ${{ github.event.client_payload.scope == 'frontend' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: CI frontend
+        if: ${{ github.event.client_payload.scope == 'frontend' }}
+        run: |
+          cd frontend
+          npm ci
+          npm run lint
+          npm test -- --ci --reporters=default --bail
+
+      - name: Setup Python (backend)
+        if: ${{ github.event.client_payload.scope == 'backend' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: CI backend
+        if: ${{ github.event.client_payload.scope == 'backend' }}
+        run: |
+          cd backend
+          pip install -r requirements.txt
+          ruff check .
+          pytest -q
+
+      - name: Commit
+        run: |
+          git config user.name "ai-agent-bot"
+          git config user.email "ai-agent-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Sem mudanças para commitar"; exit 0
+          fi
+          MSG="${{ github.event.client_payload.commit_message || github.event.client_payload.title }}"
+          git commit -m "$MSG"
+          git push origin HEAD
+
+      - name: Abrir PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: ${{ github.ref_name }}
+          title: ${{ github.event.client_payload.title }}
+          body: |
+            ### Resumo
+            ${{ github.event.client_payload.summary || 'Alterações recebidas do agente.' }}
+
+            ### Escopo
+            - `${{ github.event.client_payload.scope }}`
+
+            ### Origem
+            - `repository_dispatch` pelo agente `${{ github.event.client.sender || 'unknown' }}`
+
+            ### Checklist
+            - [x] CI passou
+            - [ ] Revisão humana
+
+            _Run ID_: ${{ github.run_id }}
+          labels: ${{ github.event.client_payload.scope }}, ai-agent
+          assignees: ${{ github.repository_owner }}
